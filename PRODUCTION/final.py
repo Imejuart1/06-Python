@@ -1,3 +1,4 @@
+
 import time
 import cv2
 import numpy as np
@@ -12,6 +13,7 @@ if template_master is None:
     print("ERROR: Template not found")
     exit()
 
+
 def detect_bottle(path):
 
     img = cv2.imread(path, 0)
@@ -20,8 +22,8 @@ def detect_bottle(path):
 
     h, w = img.shape
 
-    roi = img[int(h*0.2):int(h*0.9),
-              int(w*0.3):int(w*0.7)]
+    roi = img[int(h * 0.2):int(h * 0.9),
+              int(w * 0.3):int(w * 0.7)]
 
     template = template_master.copy()
 
@@ -29,18 +31,17 @@ def detect_bottle(path):
     th, tw = template.shape
 
     if th >= rh or tw >= rw:
-        scale = min((rh-5)/th, (rw-5)/tw)
-        template = cv2.resize(template,(0,0),fx=scale,fy=scale)
+        scale = min((rh - 5) / th, (rw - 5) / tw)
+        template = cv2.resize(template, (0, 0), fx=scale, fy=scale)
 
-    roi = cv2.GaussianBlur(roi,(5,5),0)
-    template = cv2.GaussianBlur(template,(5,5),0)
+    roi = cv2.GaussianBlur(roi, (5, 5), 0)
+    template = cv2.GaussianBlur(template, (5, 5), 0)
 
     res = cv2.matchTemplate(roi, template, cv2.TM_CCOEFF_NORMED)
     _, max_val, _, _ = cv2.minMaxLoc(res)
 
     detected = max_val > 0.55
 
-    # ONLY PRINT YOU REQUESTED
     if detected:
         print("BOTTLE DETECTED")
     else:
@@ -55,13 +56,20 @@ if __name__ == "__main__":
 
     controller = UDP_Controller()
 
+    # Digital signals
     controller.addVariable("digital_inputs1", "byte", 0)
     controller.addVariable("digital_outputs1", "byte", 0)
     controller.addVariable("digital_inputs2", "byte", 0)
     controller.addVariable("digital_outputs2", "byte", 0)
 
+    # Analog counters
+    controller.addVariable("A01", "int", 0)
+    controller.addVariable("A02", "int", 0)
+    controller.addVariable("A03", "int", 0)
+
     controller.start()
 
+    # ========= STATES =========
     latched_out0 = False
 
     cam_timer_active = False
@@ -77,6 +85,16 @@ if __name__ == "__main__":
     pulse_start = time.monotonic()
     pulse_interval = 6.0
 
+    # Counter states
+    count_A01 = 0
+    count_A02 = 0
+    count_A03 = 0
+
+    prev_IN0 = False
+    prev_IN3 = False
+    prev_IN4 = False
+
+    # ========= LOOP =========
     while True:
 
         inputs = controller.getMappedValue("digital_inputs1")
@@ -141,6 +159,27 @@ if __name__ == "__main__":
         if IN4 and last_bottle_result:
             OUT2 = True
 
+        # ---------- ANALOG COUNTERS ----------
+
+        # A01: count IN0 rising edge
+        if IN0 and not prev_IN0:
+            count_A01 += 1
+            controller.setValue("A01", count_A01)
+        prev_IN0 = IN0
+
+        # A02: count IN4 rising edge ONLY if bottle detected
+        if IN4 and not prev_IN4 and last_bottle_result:
+            count_A02 += 1
+            controller.setValue("A02", count_A02)
+        prev_IN4 = IN4
+
+        # A03: count IN3 rising edge
+        if IN3 and not prev_IN3:
+            count_A03 += 1
+            controller.setValue("A03", count_A03)
+        prev_IN3 = IN3
+
+        # ---------- OUTPUT MAP ----------
         controller.setMappedValue(
             "digital_outputs1",
             [False, False, OUT5, OUT4, OUT3, OUT2, OUT1, OUT0]
