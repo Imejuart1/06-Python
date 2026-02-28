@@ -1,51 +1,57 @@
-
 import time
 import cv2
 import numpy as np
 from Controller import UDP_Controller
 
+
+# =====================================================
+# CAMERA IMAGE PATH
+# =====================================================
 IMG_PATH = r"C:\Users\USER\Simumatik\workspace\cameras\Camera_0.jpeg"
-TEMPLATE_PATH = r"C:\Users\USER\Simumatik\workspace\cameras\template.jpeg"
-
-template_master = cv2.imread(TEMPLATE_PATH, 0)
-
-if template_master is None:
-    print("ERROR: Template not found")
-    exit()
 
 
-def detect_bottle(path):
+# =====================================================
+# BOTTLE DETECTION
+# =====================================================
+def detect_bottle(path, debug=True):
 
-    img = cv2.imread(path, 0)
+    print("VISION: Capturing image...")
+
+    img = cv2.imread(path)
     if img is None:
+        print(f"ERROR: Could not read image at {path}")
         return False
 
-    h, w = img.shape
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
 
-    roi = img[int(h * 0.2):int(h * 0.9),
-              int(w * 0.3):int(w * 0.7)]
+    kernel = np.ones((5, 5), np.uint8)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
 
-    template = template_master.copy()
+    contours, _ = cv2.findContours(
+        binary,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
 
-    rh, rw = roi.shape
-    th, tw = template.shape
+    detected = False
 
-    if th >= rh or tw >= rw:
-        scale = min((rh - 5) / th, (rw - 5) / tw)
-        template = cv2.resize(template, (0, 0), fx=scale, fy=scale)
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
 
-    roi = cv2.GaussianBlur(roi, (5, 5), 0)
-    template = cv2.GaussianBlur(template, (5, 5), 0)
+        if area > 3000:
+            detected = True
+            x, y, w, h = cv2.boundingRect(cnt)
 
-    res = cv2.matchTemplate(roi, template, cv2.TM_CCOEFF_NORMED)
-    _, max_val, _, _ = cv2.minMaxLoc(res)
+            cv2.rectangle(img, (x, y), (x+w, y+h), (0,255,0), 3)
+            cv2.putText(img, "BOTTLE", (x, y-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,0), 2)
 
-    detected = max_val > 0.55
-
-    if detected:
-        print("BOTTLE DETECTED")
-    else:
-        print("NO BOTTLE")
+    if debug:
+        cv2.imshow("Original with Detection", img)
+        cv2.imshow("Binary", binary)
+        print(f"BOTTLE DETECTED: {detected}")
+        cv2.waitKey(1)
 
     return detected
 
@@ -56,45 +62,54 @@ if __name__ == "__main__":
 
     controller = UDP_Controller()
 
-    # Digital signals
     controller.addVariable("digital_inputs1", "byte", 0)
     controller.addVariable("digital_outputs1", "byte", 0)
     controller.addVariable("digital_inputs2", "byte", 0)
     controller.addVariable("digital_outputs2", "byte", 0)
 
-    # Analog counters
     controller.addVariable("A01", "int", 0)
     controller.addVariable("A02", "int", 0)
     controller.addVariable("A03", "int", 0)
 
     controller.start()
 
-    # ========= STATES =========
     latched_out0 = False
 
+    # CAMERA STATE MACHINE
     cam_timer_active = False
     cam_timer_start = 0
-    cam_duration = 5.0
+    cam_state = 0   # 0=idle,1=wait before shot,2=wait before vision
 
     prev_IN2 = False
+    feed_blocked = False
     last_bottle_result = False
+    release_requested = False
+    in11_active = False
+    in11_timer = 0
+    in11_hold_time = 4.0
+    prev_IN11 = False
 
     prev_IN1 = False
     in1_seen = False
 
     pulse_start = time.monotonic()
-    pulse_interval = 6.0
-
-    # Counter states
+    pulse_interval_startup = 1 # before start button
+    pulse_interval_run = 5      # after start
+    feed_open = False
+    feed_timer = 0
+    feed_release_time = 0.5
+    prev_OUT0 = False
     count_A01 = 0
     count_A02 = 0
     count_A03 = 0
+    out7_timer = time.monotonic()
+    out7_state = False
+    out7_interval = 5.0
 
     prev_IN0 = False
     prev_IN3 = False
     prev_IN4 = False
 
-    # ========= LOOP =========
     while True:
 
         inputs = controller.getMappedValue("digital_inputs1")
@@ -104,6 +119,8 @@ if __name__ == "__main__":
         IN2 = inputs[-3]
         IN3 = inputs[-4]
         IN4 = inputs[-5]
+        inputs2 = controller.getMappedValue("digital_inputs2")
+        IN11 = inputs2[-4]
 
         OUT0 = False
         OUT1 = False
@@ -111,78 +128,190 @@ if __name__ == "__main__":
         OUT3 = False
         OUT4 = False
         OUT5 = False
+        OUT6 = False
+        OUT7 = False
+        OUT8 = False
 
-        # ---------- IN1 FIRST RISE ----------
+        feed_blocked = False
+
+        # ================= START BUTTON =================
         if IN1 and not prev_IN1:
             in1_seen = True
             pulse_start = time.monotonic()
+            print("SYSTEM: START BUTTON PRESSED")
 
         prev_IN1 = IN1
 
-        # ---------- 6s pulse ----------
-        if in1_seen:
-            if time.monotonic() - pulse_start >= pulse_interval:
-                OUT5 = True
-                pulse_start = time.monotonic()
+        # Detect IN11 trigger
+# IN11 rising edge trigger
+        if IN11 and not prev_IN11:
+            in11_active = True
+            in11_timer = time.monotonic()
+            print("IN11 TRIGGERED")
 
-        # ---------- LATCH ----------
+        prev_IN11 = IN11
+
+        # ================= OUT5 PULSE LOGIC =================
+        if in1_seen:
+            interval = pulse_interval_run
+        else:
+            interval = pulse_interval_startup
+
+        if time.monotonic() - pulse_start >= interval:
+            OUT5 = True
+            pulse_start = time.monotonic()
+
+        # Conveyor latch
         if IN1:
             latched_out0 = True
 
         if latched_out0:
             OUT0 = True
 
+        if OUT0 and not cam_timer_active:
+            release_requested = True
+
+        # Metal detection
         if IN0:
+            OUT0 = False
+            print("METAL DETECTED")
+        
+        # Bottle position stop
+        if IN4 and last_bottle_result:
             OUT0 = False
 
         OUT1 = IN0
         OUT3 = IN3
+        # ================= OUT7 GRAVITY STOCK RELEASE =================
+        if in1_seen:
+            if time.monotonic() - out7_timer >= out7_interval:
+                out7_state = not out7_state
+                out7_timer = time.monotonic()
 
-        # ---------- CAMERA ----------
+            OUT7 = out7_state
+        else:
+            OUT7 = False
+            out7_state = False
+        # ================= CAMERA TRIGGER =================
         if IN2 and not prev_IN2:
+            print("CAMERA: TRIGGERED")
             cam_timer_active = True
             cam_timer_start = time.monotonic()
-            OUT4 = True
-
-            last_bottle_result = detect_bottle(IMG_PATH)
+            cam_state = 1
 
         prev_IN2 = IN2
 
+        # ================= CAMERA SEQUENCE =================
         if cam_timer_active:
-            OUT4 = True
-            OUT0 = False
 
-            if time.monotonic() - cam_timer_start >= cam_duration:
-                cam_timer_active = False
+            OUT0 = False   # STOP conveyor always
 
-        # ---------- VISION RESULT ----------
+            # STEP 1: wait 2 sec before snapshot
+            if cam_state == 1:
+                if time.monotonic() - cam_timer_start >= 2.0:
+                    OUT4 = True
+                    print("CAMERA: SNAPSHOT")
+                    cam_timer_start = time.monotonic()
+                    cam_state = 2
+
+            # STEP 2: wait 2 sec for disk update
+            elif cam_state == 2:
+                OUT4 = True
+                if time.monotonic() - cam_timer_start >= 2.0:
+                    print("CAMERA: PROCESS IMAGE")
+                    last_bottle_result = detect_bottle(
+                        IMG_PATH,
+                        debug=True
+                    )
+                    cam_timer_active = False
+                    cam_state = 0
+                    print("CAMERA: DONE")
+
+        # ================= VISION RESULT =================
         if IN4 and last_bottle_result:
             OUT2 = True
+            print("ACTION: BOTTLE PUSHER ACTIVATED")
+        
+        # ================= OUT8 SAFE TIMED CONTROL =================
+        
+        if in11_active:
 
-        # ---------- ANALOG COUNTERS ----------
+            OUT8 = False
+            feed_blocked = True
 
-        # A01: count IN0 rising edge
+            if time.monotonic() - in11_timer >= in11_hold_time:
+
+                if OUT0:
+                    in11_active = False
+                    print("IN11 RELEASED: OUT0 CLEAR")
+                else:
+                    in11_timer = time.monotonic()
+                    print("WAITING: OUT0 NOT CLEAR")
+
+        else:
+            if OUT0:
+                OUT8 = True
+            else:
+                OUT8 = False
+                feed_blocked = True
+
+        # ================= GRAVITY FEED BLOCKER =================
+
+        if feed_blocked:
+            OUT6 = True
+            feed_open = False
+
+        # MASTER STOP
+        elif IN11:
+            OUT6 = True      # close blocker
+            feed_open = False
+
+        else:
+            # existing OUT6 logic continues here
+            if not OUT0:
+                OUT6 = True
+                feed_open = False
+
+            else:
+                # Open only when release requested
+                if release_requested:
+                    feed_open = True
+                    feed_timer = time.monotonic()
+                    release_requested = False
+
+                if feed_open:
+                    OUT6 = False
+
+                    if time.monotonic() - feed_timer >= feed_release_time:
+                        OUT6 = True
+                        feed_open = False
+                else:
+                    OUT6 = True
+
+
+        # ================= COUNTERS =================
         if IN0 and not prev_IN0:
             count_A01 += 1
             controller.setValue("A01", count_A01)
         prev_IN0 = IN0
 
-        # A02: count IN4 rising edge ONLY if bottle detected
         if IN4 and not prev_IN4 and last_bottle_result:
             count_A02 += 1
             controller.setValue("A02", count_A02)
         prev_IN4 = IN4
 
-        # A03: count IN3 rising edge
         if IN3 and not prev_IN3:
             count_A03 += 1
             controller.setValue("A03", count_A03)
         prev_IN3 = IN3
 
-        # ---------- OUTPUT MAP ----------
         controller.setMappedValue(
             "digital_outputs1",
-            [False, False, OUT5, OUT4, OUT3, OUT2, OUT1, OUT0]
+            [OUT7, OUT6, OUT5, OUT4, OUT3, OUT2, OUT1, OUT0]
+        )
+        controller.setMappedValue(
+            "digital_outputs2",
+            [False, False, False, False, False, False, False, OUT8]
         )
 
         time.sleep(0.05)
